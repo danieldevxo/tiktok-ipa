@@ -15,6 +15,11 @@ on:
         required: false
         type: string
         default: ""
+      base_release_tag:
+        description: "Tag of a (draft) release in THIS repo whose .ipa asset is the decrypted base IPA."
+        required: false
+        type: string
+        default: ""
       bhtiktok_ref:
         description: "BHTikTok++ git ref to build."
         required: false
@@ -98,7 +103,13 @@ jobs:
       - name: Acquire decrypted TikTok IPA
         run: |
           set -e
-          if [ -n "${{ inputs.ipa_url }}" ]; then
+          if [ -n "${{ inputs.base_release_tag }}" ]; then
+            echo "Fetching base IPA from release tag: ${{ inputs.base_release_tag }}"
+            gh release download "${{ inputs.base_release_tag }}" \
+              --repo "$GITHUB_REPOSITORY" --pattern '*.ipa' --dir dl
+            SRC=$(find dl -name '*.ipa' | head -n 1)
+            [ -n "$SRC" ] && mv "$SRC" base.ipa
+          elif [ -n "${{ inputs.ipa_url }}" ]; then
             echo "Using provided ipa_url"
             curl -fL --retry 3 --retry-delay 5 -o base.ipa "${{ inputs.ipa_url }}"
           else
