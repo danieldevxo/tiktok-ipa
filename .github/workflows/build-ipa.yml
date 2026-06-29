@@ -1,0 +1,176 @@
+name: Build TikTok IPA (BHTikTok++)
+
+# Builds the BHTikTok++ tweak (fake verify / fake follower & following counts /
+# show username + in-app settings) and injects it into a DECRYPTED TikTok IPA.
+#
+# A decrypted IPA is required. Pass it via `ipa_url`, or the job will try a few
+# community sources automatically (often unavailable — providing the URL is the
+# reliable path; e.g. grab the latest decrypted build from decrypt.day).
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: "Direct URL to a DECRYPTED TikTok IPA (leave empty to auto-fetch)."
+        required: false
+        type: string
+        default: ""
+      bhtiktok_ref:
+        description: "BHTikTok++ git ref to build."
+        required: false
+        type: string
+        default: "main"
+      release:
+        description: "Create a GitHub Release with the IPA?"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+permissions:
+  contents: write
+
+jobs:
+  build-tweak:
+    name: Build BHTikTok++ (.deb)
+    runs-on: macos-15
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Clone BHTikTok++
+        run: |
+          git clone --depth 1 --branch "${{ inputs.bhtiktok_ref }}" \
+            https://github.com/raulsaeed/BHTikTokPlusPlus.git bhtiktok
+
+      - name: Cache Theos
+        id: cache-theos
+        uses: actions/cache@v4
+        with:
+          path: theos
+          key: theos-${{ runner.os }}-v1
+
+      - name: Setup Theos
+        if: steps.cache-theos.outputs.cache-hit != 'true'
+        uses: Randomblock1/theos-action@v1
+
+      # Homebrew packages do not persist across runs; install signing/packaging
+      # tools every run so a Theos cache-hit doesn't break the build.
+      - name: Install packaging tools (ldid, dpkg, make)
+        run: brew install ldid dpkg make
+
+      - name: Set GNU Make path
+        run: echo "PATH=$(brew --prefix make)/libexec/gnubin:$PATH" >> $GITHUB_ENV
+
+      - name: Build .deb
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: |
+          set -e
+          cd bhtiktok
+          # The FLEX explorer is reached purely via %c(FLEXManager) at runtime,
+          # so the FLEXing submodule is not needed to compile.
+          make package FINALPACKAGE=1 THEOS=$THEOS
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          find packages -name "*.deb" -exec cp {} "$GITHUB_WORKSPACE/out/" \;
+          ls -lh "$GITHUB_WORKSPACE/out"
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: tweak-deb
+          path: out/*.deb
+          if-no-files-found: error
+
+  inject:
+    name: Inject into TikTok IPA
+    needs: build-tweak
+    runs-on: macos-15
+    steps:
+      - name: Download tweak artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tweak-deb
+          path: artifacts
+
+      - name: Acquire decrypted TikTok IPA
+        run: |
+          set -e
+          if [ -n "${{ inputs.ipa_url }}" ]; then
+            echo "Using provided ipa_url"
+            curl -fL --retry 3 --retry-delay 5 -o base.ipa "${{ inputs.ipa_url }}"
+          else
+            echo "Trying community decrypted-IPA sources for TikTok..."
+            CANDIDATES=(
+              "https://ipa.aspy.dev/tiktok/stable/TikTok_latest.ipa"
+              "https://ipa.bwlok.dev/TikTok.ipa"
+            )
+            for url in "${CANDIDATES[@]}"; do
+              echo "::group::Trying $url"
+              if curl -fL --retry 2 --retry-delay 3 --max-time 1200 -o base.ipa "$url"; then
+                TYPE=$(file --mime-type -b base.ipa || echo "?")
+                if [ "$TYPE" = "application/zip" ]; then
+                  echo "Got ipa from: $url"; echo "::endgroup::"; break
+                fi
+                rm -f base.ipa
+              else
+                rm -f base.ipa
+              fi
+              echo "::endgroup::"
+            done
+          fi
+          if [ ! -f base.ipa ]; then
+            echo "::error::No decrypted TikTok IPA. Re-run with a manual 'ipa_url' (e.g. a decrypt.day link)."
+            exit 1
+          fi
+          ls -lh base.ipa
+
+      - name: Validate IPA
+        run: |
+          TYPE=$(file --mime-type -b base.ipa)
+          echo "mime: $TYPE"
+          if [ "$TYPE" != "application/zip" ]; then
+            echo "::error::Downloaded file is not a valid IPA/zip ($TYPE)."
+            exit 1
+          fi
+
+      - name: Install cyan (pyzule-rw)
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install --break-system-packages https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
+
+      - name: Inject tweak into TikTok IPA
+        run: |
+          set -e
+          DEB_PATH=$(find ./artifacts -name "*.deb" | head -n 1)
+          echo "Using DEB: $DEB_PATH"
+          cyan -uwsgq -i base.ipa -o "TikTok+.ipa" -f "$DEB_PATH"
+          ls -lh "TikTok+.ipa"
+
+      - name: Read TikTok version
+        id: ver
+        run: |
+          set -e
+          mkdir -p probe && unzip -q base.ipa -d probe
+          APP=$(ls -d probe/Payload/*.app | head -n 1)
+          V=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist" 2>/dev/null || echo "unknown")
+          echo "version=$V" >> $GITHUB_OUTPUT
+          echo "TikTok version: $V"
+
+      - name: Upload final IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: TikTok-plus-${{ steps.ver.outputs.version }}-ipa
+          path: TikTok+.ipa
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: ${{ inputs.release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: TikTok++ ${{ steps.ver.outputs.version }}
+          files: TikTok+.ipa
+          generate_release_notes: true
