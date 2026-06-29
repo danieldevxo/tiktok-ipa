@@ -1,0 +1,115 @@
+name: Recon (class-dump TikTok)
+
+# Fetches a DECRYPTED TikTok IPA and class-dumps the main binary so we can
+# confirm the real (obfuscated, version-specific) class / property names used
+# by the profile model. The build tweak hooks depend on these names.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: "(Optional) Direct URL to a DECRYPTED TikTok IPA. Leave empty to auto-fetch."
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  recon:
+    name: class-dump TikTok
+    runs-on: macos-15
+    steps:
+      - name: Acquire decrypted TikTok IPA
+        run: |
+          set -e
+          if [ -n "${{ inputs.ipa_url }}" ]; then
+            echo "Using provided ipa_url"
+            curl -fL --retry 3 --retry-delay 5 -o app.ipa "${{ inputs.ipa_url }}"
+          else
+            echo "Trying community decrypted-IPA sources for TikTok..."
+            CANDIDATES=(
+              "https://ipa.aspy.dev/tiktok/stable/TikTok_latest.ipa"
+              "https://ipa.aspy.dev/musically/stable/TikTok_latest.ipa"
+              "https://ipa.bwlok.dev/TikTok.ipa"
+            )
+            for url in "${CANDIDATES[@]}"; do
+              echo "::group::Trying $url"
+              if curl -fL --retry 2 --retry-delay 3 --max-time 1200 -o app.ipa "$url"; then
+                TYPE=$(file --mime-type -b app.ipa || echo "?")
+                if [ "$TYPE" = "application/zip" ]; then
+                  echo "Got a zip/ipa from: $url"; echo "::endgroup::"; break
+                fi
+                echo "Not a valid IPA ($TYPE)"; rm -f app.ipa
+              else
+                echo "Download failed"; rm -f app.ipa
+              fi
+              echo "::endgroup::"
+            done
+          fi
+          if [ ! -f app.ipa ]; then
+            echo "::error::Could not obtain a decrypted TikTok IPA. Re-run with a manual 'ipa_url'."
+            exit 1
+          fi
+          ls -lh app.ipa
+
+      - name: Unpack & locate main binary
+        run: |
+          set -e
+          mkdir -p extracted
+          unzip -q app.ipa -d extracted
+          APP=$(ls -d extracted/Payload/*.app | head -n 1)
+          echo "App bundle: $APP"
+          EXEC=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")
+          BIN="$APP/$EXEC"
+          echo "Executable: $BIN"
+          file "$BIN"
+          echo "BIN=$BIN" >> $GITHUB_ENV
+
+      - name: Install class-dump
+        run: brew install class-dump || brew install --HEAD class-dump
+
+      - name: class-dump
+        run: |
+          set -e
+          mkdir -p headers
+          # Some TikTok builds are fat binaries; class-dump picks an arch itself.
+          class-dump -H -o headers "$BIN" 2>dump.log || {
+            echo "class-dump returned non-zero; partial output may still be useful";
+            cat dump.log | tail -n 40;
+          }
+          echo "Header files generated: $(ls headers | wc -l)"
+
+      - name: Summarize likely spoof targets
+        run: |
+          set +e
+          {
+            echo "# Recon summary"
+            echo
+            echo "## Header files: $(ls headers 2>/dev/null | wc -l)"
+            echo
+            echo "## Candidate user-model headers"
+            ls headers | grep -iE 'user(model|info)|account(model|user)|profile(model|viewmodel)|AWEUser' | head -n 60
+            echo
+            echo "## Property hits across all headers"
+            for prop in verificationType enterpriseVerifyReason customVerify isVerified verifyInfo \
+                        followerCount followingCount totalFavorited favoritingCount awemeCount \
+                        nickname uniqueId secUid signature; do
+              echo "### $prop"
+              grep -rEn "[^a-zA-Z]$prop[^a-zA-Z]" headers | head -n 12
+              echo
+            done
+          } > recon-summary.md 2>/dev/null
+          echo "----- recon-summary.md -----"
+          cat recon-summary.md
+
+      - name: Upload headers + summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiktok-classdump
+          path: |
+            headers/**
+            recon-summary.md
+            dump.log
+          if-no-files-found: warn
