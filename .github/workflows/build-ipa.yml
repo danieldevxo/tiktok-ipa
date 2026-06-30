@@ -161,6 +161,15 @@ jobs:
           cyan -uwsgq -i base.ipa -o "TikTok+.ipa" -f "$DEB_PATH"
           ls -lh "TikTok+.ipa"
 
+      # A clean, fakesigned (no-tweak) build. Needed for the well-known TikTok
+      # sideload login fix: install STOCK, log in, then install TikTok+ over it
+      # (same bundle id keeps the session). Extensions are kept (no -g).
+      - name: Build STOCK sideload IPA (login helper)
+        run: |
+          set -e
+          cyan -uwsq -i base.ipa -o "TikTok-STOCK.ipa"
+          ls -lh "TikTok-STOCK.ipa"
+
       - name: Read TikTok version
         id: ver
         run: |
@@ -171,11 +180,13 @@ jobs:
           echo "version=$V" >> $GITHUB_OUTPUT
           echo "TikTok version: $V"
 
-      - name: Upload final IPA
+      - name: Upload final IPAs
         uses: actions/upload-artifact@v4
         with:
           name: TikTok-plus-${{ steps.ver.outputs.version }}-ipa
-          path: TikTok+.ipa
+          path: |
+            TikTok+.ipa
+            TikTok-STOCK.ipa
           if-no-files-found: error
 
       - name: Create GitHub Release
@@ -184,5 +195,7 @@ jobs:
         with:
           tag_name: v${{ steps.ver.outputs.version }}
           name: TikTok++ ${{ steps.ver.outputs.version }}
-          files: TikTok+.ipa
+          files: |
+            TikTok+.ipa
+            TikTok-STOCK.ipa
           generate_release_notes: true
